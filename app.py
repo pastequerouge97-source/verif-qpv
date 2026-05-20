@@ -25,6 +25,7 @@ from verif_qpv import (
     QPV_CODE_CANDIDATES,
     QPV_NAME_CANDIDATES,
     QPV_DATASET_SLUG,
+    build_address_series,
     detect_col,
     download_qpv_dataset,
     find_qpv,
@@ -32,6 +33,7 @@ from verif_qpv import (
     geocode,
     geocode_batch_csv,
     load_qpv,
+    normalize_address,
 )
 
 
@@ -250,10 +252,13 @@ with tab_unitaire:
         st.warning("⬅ Charge d'abord le référentiel QPV via la barre latérale.")
 
     if go:
-        addr = " ".join(x.strip() for x in [u_numero, u_rue, u_cp, u_ville] if x.strip())
+        raw_addr = " ".join(x.strip() for x in [u_numero, u_rue, u_cp, u_ville] if x.strip())
+        addr = normalize_address(raw_addr)
         if not addr:
             st.error("Saisis au moins une partie de l'adresse.")
         else:
+            if addr != raw_addr:
+                st.caption(f"Adresse normalisée : `{addr}` (double numéro détecté)")
             with st.spinner("Géocodage et test QPV…"):
                 geo_res = _geocode_cached(addr, u_cp.strip(), "")
                 en_qpv, code_q, nom_q = find_qpv(
@@ -424,6 +429,12 @@ with tab_lot:
         ready = col_rue != "(aucune)" and col_ville != "(aucune)"
         if not ready:
             st.info("Mappe au moins **voie** et **ville** pour pouvoir lancer.")
+        else:
+            st.caption(
+                "💡 Si N° et voie sont dans **la même colonne** (cas Emmy), laisse N° à `(aucune)` "
+                "et mappe-la dans **Voie/rue**. Les doubles numéros `8/10`, `8-10`, `8 et 10` "
+                "sont automatiquement réduits au premier."
+            )
 
         use_batch = st.toggle(
             "⚡ Mode batch (recommandé)",
@@ -435,18 +446,11 @@ with tab_lot:
             t0 = time.time()
             session = requests.Session()
 
-            address_cols = [c for c in [col_num, col_rue, col_ville] if c != "(aucune)"]
+            address_cols = [c for c in [col_num, col_rue, col_cp, col_ville] if c != "(aucune)"]
             postcode_col = col_cp if col_cp != "(aucune)" else ""
 
-            # Adresse reconstituée pour traçabilité
-            parts = []
-            for c in [col_num, col_rue, col_cp, col_ville]:
-                if c != "(aucune)":
-                    parts.append(df[c].astype(str).str.strip())
-            addr_series = parts[0]
-            for p in parts[1:]:
-                addr_series = addr_series + " " + p
-            addr_series = addr_series.str.replace(r"\s+", " ", regex=True).str.strip()
+            # Adresse normalisée pour traçabilité (mêmes règles que la BAN reçoit)
+            addr_series = build_address_series(df, address_cols, normalize=True)
 
             if use_batch:
                 with st.spinner("Géocodage batch via l'API BAN…"):
@@ -477,14 +481,14 @@ with tab_lot:
                         statut.append("Non")
 
                 enriched = df.copy()
-                enriched["adresse_envoyee"] = addr_series
-                enriched["adresse_ban"]     = geo_df["adresse_ban"]
-                enriched["lat"]             = geo_df["lat"]
-                enriched["lon"]             = geo_df["lon"]
-                enriched["score_ban"]       = geo_df["score_ban"]
+                enriched["adresse_envoyee"] = geo_df["adresse_envoyee"].values
+                enriched["adresse_ban"]     = geo_df["adresse_ban"].values
+                enriched["lat"]             = geo_df["lat"].values
+                enriched["lon"]             = geo_df["lon"].values
+                enriched["score_ban"]       = geo_df["score_ban"].values
                 enriched["en_qpv"]          = statut
-                enriched["code_qpv"]        = qpv_df["code_qpv"]
-                enriched["nom_qpv"]         = qpv_df["nom_qpv"]
+                enriched["code_qpv"]        = qpv_df["code_qpv"].values
+                enriched["nom_qpv"]         = qpv_df["nom_qpv"].values
             else:
                 progress = st.progress(0.0, text="Initialisation…")
                 results = []

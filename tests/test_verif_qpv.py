@@ -13,11 +13,13 @@ from verif_qpv import (
     QPV_CODE_CANDIDATES,
     QPV_NAME_CANDIDATES,
     _pick_shapefile_in_zip,
+    build_address_series,
     detect_col,
     find_qpv,
     find_qpv_batch,
     geocode,
     geocode_batch_csv,
+    normalize_address,
     pick_shapefile_resource,
 )
 
@@ -207,10 +209,11 @@ class TestGeocodeBatchCsv:
             "cp": ["75001", "75002"],
             "ville": ["Paris", "Paris"],
         })
+        # La réponse BAN reprend les colonnes envoyées : _row_id, address, postcode_v + result_*
         response_csv = (
-            "_row_id,numero,rue,cp,ville,result_label,result_score,latitude,longitude\n"
-            "0,1,rue A,75001,Paris,1 rue A 75001 Paris,0.91,48.860,2.340\n"
-            "1,2,rue B,75002,Paris,2 rue B 75002 Paris,0.88,48.870,2.350\n"
+            "_row_id,address,postcode_v,result_label,result_score,latitude,longitude\n"
+            "0,1 rue A 75001 Paris,75001,1 rue A 75001 Paris,0.91,48.860,2.340\n"
+            "1,2 rue B 75002 Paris,75002,2 rue B 75002 Paris,0.88,48.870,2.350\n"
         )
         sess = MagicMock()
         resp = MagicMock()
@@ -230,12 +233,34 @@ class TestGeocodeBatchCsv:
         assert out.iloc[0]["lon"] == 2.340
         assert out.iloc[0]["score_ban"] == 0.91
         assert out.iloc[0]["adresse_ban"] == "1 rue A 75001 Paris"
-        # Vérifie que les bons params ont été passés
+        assert out.iloc[0]["adresse_envoyee"] == "1 rue A Paris"
+        # On envoie maintenant une seule colonne 'address' à la BAN
         call = sess.post.call_args
         sent_data = call.kwargs.get("data") or []
-        assert ("columns", "numero") in sent_data
-        assert ("columns", "rue") in sent_data
-        assert ("postcode", "cp") in sent_data
+        assert ("columns", "address") in sent_data
+        assert ("postcode", "postcode_v") in sent_data
+
+    def test_normalizes_double_numbers_in_payload(self):
+        """Vérifie que '8/10 rue X' devient '8 rue X' dans le CSV envoyé."""
+        df = pd.DataFrame({"adresse": ["8/10 rue des Champs Paris"]})
+        response_csv = (
+            "_row_id,address,result_label,result_score,latitude,longitude\n"
+            "0,8 rue des Champs Paris,8 rue des Champs 75008 Paris,0.95,48.87,2.32\n"
+        )
+        sess = MagicMock()
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.content = response_csv.encode("utf-8")
+        sess.post.return_value = resp
+
+        out = geocode_batch_csv(df, address_cols=["adresse"], session=sess)
+        # Le CSV envoyé en multipart contient l'adresse normalisée
+        files = sess.post.call_args.kwargs["files"]
+        sent_csv = files["data"][1].decode("utf-8")
+        assert "8 rue des Champs Paris" in sent_csv
+        assert "8/10" not in sent_csv
+        # adresse_envoyee dans le résultat reflète aussi la normalisation
+        assert out.iloc[0]["adresse_envoyee"] == "8 rue des Champs Paris"
 
     def test_empty_df_returns_empty(self):
         sess = MagicMock()
@@ -319,3 +344,74 @@ class TestPickShapefileInZip:
 
     def test_no_shapefile_returns_none(self):
         assert _pick_shapefile_in_zip(["data.geojson", "readme.txt"]) is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# normalize_address
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestNormalizeAddress:
+    @pytest.mark.parametrize("addr, expected", [
+        ("8/10 rue des Champs",       "8 rue des Champs"),
+        ("8-10 rue des Champs",       "8 rue des Champs"),
+        ("8 / 10 rue des Champs",     "8 rue des Champs"),
+        ("8 - 10 rue X",              "8 rue X"),
+        ("8 et 10 rue X",             "8 rue X"),
+        ("8 à 10 rue X",              "8 rue X"),
+        ("8 a 10 rue X",              "8 rue X"),
+        ("8 bis/10 rue X",            "8 bis rue X"),
+        ("8 ter - 10 rue X",          "8 ter rue X"),
+        ("8 bis et 10 ter rue X",     "8 bis rue X"),
+        ("  8/10 rue X",              "8 rue X"),
+    ])
+    def test_double_number(self, addr, expected):
+        assert normalize_address(addr) == expected
+
+    @pytest.mark.parametrize("addr", [
+        "12 rue saint-michel",          # tiret dans le nom de rue
+        "rue de la Paix",                # pas de numéro
+        "1 rue Notre-Dame-de-Lorette",   # tirets dans le nom
+        "5 place de la République 75011 Paris",
+        "8 bis rue X",                   # numéro+suffixe seul
+    ])
+    def test_unchanged(self, addr):
+        assert normalize_address(addr) == addr
+
+    def test_empty(self):
+        assert normalize_address("") == ""
+
+    def test_collapses_whitespace(self):
+        assert normalize_address("8/10   rue   des   Champs") == "8 rue des Champs"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# build_address_series
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestBuildAddressSeries:
+    def test_combines_columns_and_normalizes(self):
+        df = pd.DataFrame({
+            "numero": ["8/10", "12", ""],
+            "rue":    ["rue X", "rue Y", "rue Z"],
+            "cp":     ["75001", "75002", "75003"],
+            "ville":  ["Paris", "Paris", "Paris"],
+        })
+        out = build_address_series(df, ["numero", "rue", "cp", "ville"])
+        assert out.tolist() == [
+            "8 rue X 75001 Paris",
+            "12 rue Y 75002 Paris",
+            "rue Z 75003 Paris",
+        ]
+
+    def test_can_skip_normalization(self):
+        df = pd.DataFrame({"a": ["8/10 rue X"]})
+        assert build_address_series(df, ["a"], normalize=False).iloc[0] == "8/10 rue X"
+
+    def test_handles_nan(self):
+        df = pd.DataFrame({"a": [None, "12"], "b": ["rue X", "rue Y"]})
+        out = build_address_series(df, ["a", "b"])
+        assert out.tolist() == ["rue X", "12 rue Y"]
+
+    def test_raises_on_empty_cols(self):
+        with pytest.raises(ValueError):
+            build_address_series(pd.DataFrame({"a": [1]}), [])

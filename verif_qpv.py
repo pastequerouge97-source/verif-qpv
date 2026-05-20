@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import re
 import sys
 import time
 import zipfile
@@ -78,6 +79,60 @@ QPV_NAME_CANDIDATES = [
 
 
 # ---------------------------------------------------------------------------
+# Normalisation d'adresse
+# ---------------------------------------------------------------------------
+
+# Détecte un double numéro en tête d'adresse :
+#   "8/10 rue X", "8-10 rue X", "8 et 10 rue X", "8 à 10 rue X",
+#   "8 bis/10 rue X", "8 bis - 10 ter rue X"...
+# Garde le premier numéro (avec son éventuel suffixe), supprime le second.
+_MULTI_NUM_RE = re.compile(
+    r"^(\s*\d+(?:\s+(?:bis|ter|quater))?)"      # group 1 : premier numéro (+suffixe)
+    r"\s*(?:[/\-]|\s+(?:et|à|a)\s+)\s*"         # séparateur : / - ' et ' ' à ' ' a '
+    r"\d+(?:\s+(?:bis|ter|quater))?"            # second numéro (à supprimer)
+    r"(?=\s+\D|$)",                              # suivi d'un espace+non-chiffre ou fin
+    flags=re.IGNORECASE,
+)
+
+
+def normalize_address(addr: str) -> str:
+    """Normalise une adresse pour le géocodage BAN.
+
+    Transforme les doubles numéros en tête (cas fréquent dans Emmy) :
+        "8/10 rue des Champs"     → "8 rue des Champs"
+        "8-10 rue X"              → "8 rue X"
+        "8 et 10 rue X"           → "8 rue X"
+        "8 bis/10 rue X"          → "8 bis rue X"
+        "12 rue saint-michel"     → "12 rue saint-michel"  (pas de double numéro)
+
+    Le suffixe bis/ter/quater du premier numéro est préservé.
+    """
+    if not addr:
+        return addr
+    out = _MULTI_NUM_RE.sub(r"\1", addr)
+    # Normalise les espaces multiples
+    return re.sub(r"\s+", " ", out).strip()
+
+
+def build_address_series(
+    df: pd.DataFrame,
+    address_cols: list[str],
+    normalize: bool = True,
+) -> pd.Series:
+    """Concatène plusieurs colonnes en une adresse unique, optionnellement normalisée."""
+    if not address_cols:
+        raise ValueError("address_cols ne peut pas être vide")
+    parts = [df[c].fillna("").astype(str).str.strip() for c in address_cols]
+    addr = parts[0]
+    for p in parts[1:]:
+        addr = addr + " " + p
+    addr = addr.str.replace(r"\s+", " ", regex=True).str.strip()
+    if normalize:
+        addr = addr.map(normalize_address)
+    return addr
+
+
+# ---------------------------------------------------------------------------
 # Géocodage — mode unitaire
 # ---------------------------------------------------------------------------
 
@@ -87,10 +142,14 @@ def geocode(
     citycode: str = "",
     session: Optional[requests.Session] = None,
 ) -> dict:
-    """Appelle l'API BAN sur une adresse unitaire et renvoie un dict normalisé."""
+    """Appelle l'API BAN sur une adresse unitaire et renvoie un dict normalisé.
+
+    L'adresse est normalisée avant envoi (gestion des doubles numéros "8/10 rue X").
+    """
     empty = {"lat": None, "lon": None, "score": None, "label": None}
     if not query or not query.strip():
         return empty
+    query = normalize_address(query)
     if session is None:
         session = requests.Session()
     params = {"q": query, "limit": 1, "autocomplete": 0}
@@ -132,8 +191,11 @@ def geocode_batch_csv(
 ) -> pd.DataFrame:
     """Géocode un DataFrame entier via l'endpoint /search/csv/ de la BAN.
 
+    Les adresses sont concaténées depuis `address_cols`, normalisées
+    (doubles numéros "8/10" → "8"), puis envoyées à la BAN en un seul appel.
+
     Renvoie un DataFrame indexé comme `df` avec les colonnes :
-        adresse_ban, lat, lon, score_ban
+        adresse_envoyee (str), adresse_ban (str), lat (float), lon (float), score_ban (float)
 
     Si `df` dépasse BATCH_MAX_ROWS, il est découpé en plusieurs requêtes.
     `progress_cb(done, total)` est appelé à chaque chunk si fourni.
@@ -145,7 +207,7 @@ def geocode_batch_csv(
 
     n = len(df)
     if n == 0:
-        return pd.DataFrame(columns=["adresse_ban", "lat", "lon", "score_ban"])
+        return pd.DataFrame(columns=["adresse_envoyee", "adresse_ban", "lat", "lon", "score_ban"])
 
     chunks = []
     total_chunks = (n + BATCH_MAX_ROWS - 1) // BATCH_MAX_ROWS
@@ -170,23 +232,34 @@ def _geocode_one_chunk(
     citycode_col: str,
     session: requests.Session,
 ) -> pd.DataFrame:
-    """Envoie un seul chunk au endpoint batch BAN et parse la réponse."""
-    cols_needed = list(dict.fromkeys(address_cols + (
-        [postcode_col] if postcode_col else []
-    ) + (
-        [citycode_col] if citycode_col else []
-    )))
-    payload = df[cols_needed].astype(str).fillna("")
-    payload = payload.reset_index(drop=True)
-    payload.insert(0, "_row_id", range(len(payload)))
+    """Envoie un chunk au endpoint batch BAN et parse la réponse.
+
+    Construit une colonne 'address' normalisée (gestion des doubles numéros)
+    avant l'envoi, plutôt que de laisser la BAN concaténer plusieurs colonnes.
+    """
+    addr_series = build_address_series(df, address_cols, normalize=True)
+
+    payload_dict: dict = {
+        "_row_id": list(range(len(df))),
+        "address": addr_series.tolist(),
+    }
+    if postcode_col:
+        payload_dict["postcode_v"] = (
+            df[postcode_col].fillna("").astype(str).str.strip().tolist()
+        )
+    if citycode_col:
+        payload_dict["citycode_v"] = (
+            df[citycode_col].fillna("").astype(str).str.strip().tolist()
+        )
+    payload = pd.DataFrame(payload_dict)
 
     csv_bytes = payload.to_csv(sep=",", encoding="utf-8", index=False).encode("utf-8")
 
-    data: list[tuple[str, str]] = [("columns", c) for c in address_cols]
+    data: list[tuple[str, str]] = [("columns", "address")]
     if postcode_col:
-        data.append(("postcode", postcode_col))
+        data.append(("postcode", "postcode_v"))
     if citycode_col:
-        data.append(("citycode", citycode_col))
+        data.append(("citycode", "citycode_v"))
 
     files = {"data": ("input.csv", csv_bytes, "text/csv")}
     r = session.post(BAN_CSV_URL, data=data, files=files, timeout=BATCH_TIMEOUT)
@@ -201,6 +274,7 @@ def _geocode_one_chunk(
     result = result.sort_values("_row_id").reset_index(drop=True)
 
     out = pd.DataFrame({
+        "adresse_envoyee": addr_series.values,
         "adresse_ban": result.get("result_label", "").astype(str),
         "lat": pd.to_numeric(result.get("latitude", ""), errors="coerce"),
         "lon": pd.to_numeric(result.get("longitude", ""), errors="coerce"),
@@ -531,17 +605,9 @@ def main():
 
     print(f"\n[3/3] Géocodage BAN + test QPV ({'batch' if args.batch else 'unitaire'})")
     session = requests.Session()
-    addr_cols = [args.col_numero, args.col_rue, args.col_ville]
+    addr_cols = [args.col_numero, args.col_rue, args.col_cp, args.col_ville]
 
     if args.batch:
-        # Reconstruit "adresse_envoyee" pour la traçabilité
-        addr_series = (
-            df[args.col_numero].fillna("").astype(str).str.strip() + " "
-            + df[args.col_rue].fillna("").astype(str).str.strip() + " "
-            + df[args.col_cp].fillna("").astype(str).str.strip() + " "
-            + df[args.col_ville].fillna("").astype(str).str.strip()
-        ).str.replace(r"\s+", " ", regex=True).str.strip()
-
         geo_df = geocode_batch_csv(
             df, address_cols=addr_cols,
             postcode_col=args.col_cp, citycode_col="",
@@ -550,17 +616,17 @@ def main():
         qpv_df = find_qpv_batch(geo_df["lat"], geo_df["lon"], qpv, code_col, name_col)
 
         enriched = df.copy()
-        enriched["adresse_envoyee"] = addr_series
-        enriched["adresse_ban"]     = geo_df["adresse_ban"]
-        enriched["lat"]             = geo_df["lat"]
-        enriched["lon"]             = geo_df["lon"]
-        enriched["score_ban"]       = geo_df["score_ban"]
+        enriched["adresse_envoyee"] = geo_df["adresse_envoyee"].values
+        enriched["adresse_ban"]     = geo_df["adresse_ban"].values
+        enriched["lat"]             = geo_df["lat"].values
+        enriched["lon"]             = geo_df["lon"].values
+        enriched["score_ban"]       = geo_df["score_ban"].values
         enriched["en_qpv"] = [
             ("Adresse non géocodée" if pd.isna(la) else ("Oui" if oui else "Non"))
             for la, oui in zip(geo_df["lat"], qpv_df["en_qpv"])
         ]
-        enriched["code_qpv"] = qpv_df["code_qpv"]
-        enriched["nom_qpv"]  = qpv_df["nom_qpv"]
+        enriched["code_qpv"] = qpv_df["code_qpv"].values
+        enriched["nom_qpv"]  = qpv_df["nom_qpv"].values
     else:
         sindex = qpv.sindex
         out_rows = []
@@ -570,7 +636,7 @@ def main():
             rue    = str(row[args.col_rue]).strip()
             cp     = str(row[args.col_cp]).strip()
             ville  = str(row[args.col_ville]).strip()
-            addr   = " ".join(x for x in [numero, rue, cp, ville] if x)
+            addr   = normalize_address(" ".join(x for x in [numero, rue, cp, ville] if x))
 
             geo = geocode(addr, postcode=cp, citycode="", session=session)
             en_qpv, code_q, nom_q = find_qpv(

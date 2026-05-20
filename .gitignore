@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Donnees QPV (lourdes — a telecharger depuis data.gouv.fr)
+dataqpv/
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.qpj
+*.gpkg
+*.geojson
+QP2024*
+QPV*.zip
+
+# Uploads utilisateur
+uploads/
+outputs_local/
+
+# Logs / audit
+audit.jsonl
+*.log
+
+# Resultats generes
+*_qpv.csv
+*.parquet

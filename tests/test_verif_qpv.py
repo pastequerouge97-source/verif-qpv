@@ -383,6 +383,39 @@ class TestNormalizeAddress:
     def test_collapses_whitespace(self):
         assert normalize_address("8/10   rue   des   Champs") == "8 rue des Champs"
 
+    # ── Cas Emmy : annotations cadastrales + adresse dupliquée ─────────────
+    def test_emmy_strips_parcelle_and_dedupes(self):
+        addr = (
+            "42 BOULEVARD JEROME TRESSAGUET - Parcelle : 000 , CR ,0694 "
+            "42 BOULEVARD JEROME TRESSAGUET - Parcelle : 000 , CR ,0694 "
+            "58000 Nevers"
+        )
+        assert normalize_address(addr) == "42 BOULEVARD JEROME TRESSAGUET 58000 Nevers"
+
+    def test_emmy_parcelle_with_slash_refs(self):
+        addr = (
+            "39 AVENUE JEAN MOULIN - Parcelle : 000 / AB / 0119 "
+            "39 AVENUE JEAN MOULIN - Parcelle : 000 / AB / 0119 "
+            "24700 Montpon-Menesterol"
+        )
+        assert normalize_address(addr) == "39 AVENUE JEAN MOULIN 24700 Montpon-Menesterol"
+
+    def test_emmy_parcelle_with_multinum(self):
+        addr = (
+            "7 rue de corse - Parcelle : 000/DX/0072 "
+            "7/9 rue de corse - Parcelle : 000/DX/0072 "
+            "93600 AULNAY sous bois"
+        )
+        assert normalize_address(addr) == "7 rue de corse 93600 AULNAY sous bois"
+
+    def test_emmy_dedupe_with_multinum_in_middle(self):
+        addr = "107 RUE GALLIEN 107/113 RUE GALLIEN 93000 BOBIGNY"
+        assert normalize_address(addr) == "107 RUE GALLIEN 93000 BOBIGNY"
+
+    def test_multinum_anywhere_not_just_start(self):
+        """Le double numéro est normalisé même au milieu de l'adresse."""
+        assert normalize_address("résidence A 8/10 rue des Lilas") == "résidence A 8 rue des Lilas"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # build_address_series

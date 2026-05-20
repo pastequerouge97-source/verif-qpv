@@ -82,36 +82,102 @@ QPV_NAME_CANDIDATES = [
 # Normalisation d'adresse
 # ---------------------------------------------------------------------------
 
-# Détecte un double numéro en tête d'adresse :
-#   "8/10 rue X", "8-10 rue X", "8 et 10 rue X", "8 à 10 rue X",
-#   "8 bis/10 rue X", "8 bis - 10 ter rue X"...
-# Garde le premier numéro (avec son éventuel suffixe), supprime le second.
-_MULTI_NUM_RE = re.compile(
-    r"^(\s*\d+(?:\s+(?:bis|ter|quater))?)"      # group 1 : premier numéro (+suffixe)
-    r"\s*(?:[/\-]|\s+(?:et|à|a)\s+)\s*"         # séparateur : / - ' et ' ' à ' ' a '
-    r"\d+(?:\s+(?:bis|ter|quater))?"            # second numéro (à supprimer)
-    r"(?=\s+\D|$)",                              # suivi d'un espace+non-chiffre ou fin
+# Mots-clés de type de voie en France (utilisés pour détecter le début d'une adresse).
+_STREET_TYPES = (
+    r"rue|av|avenue|bd|boulevard|impasse|imp|place|pl|all[ée]e|chemin|ch|route|"
+    r"cours|quai|villa|voie|passage|sentier|cit[eé]|square|esplanade|faubourg|parc|"
+    r"r[ée]sidence|lotissement|hameau|mont[ée]e|mte|traverse|carrefour"
+)
+
+# Marqueurs de fin d'annotation cadastrale : un postcode 5 chiffres,
+# un pattern "numéro(s) + type de voie", ou la fin de la chaîne.
+# Les sous-numéros utilisent / ou - mais PAS d'espace (sinon on capture trop loin).
+_END_OF_METADATA = (
+    r"(?="
+    r"\s+\d{5}\b"
+    rf"|\s+\d+(?:[/\-]\d+)*(?:\s+(?:bis|ter|quater))?\s+(?:{_STREET_TYPES})\b"
+    r"|$"
+    r")"
+)
+
+# Annotations Emmy / cadastre — "Parcelle : 000/AB/0119", "Références cadastrales : ...",
+# "CR ,0694", etc.
+_METADATA_RE = re.compile(
+    r"\s*[-,;]?\s*"
+    r"(?:parcelles?|r[ée]f[ée]rences?\s+cadastrales?|cadastr[ée]e?s?)"
+    r"\s*:?\s*"
+    r"[\w/.,\s\-]+?"
+    + _END_OF_METADATA,
     flags=re.IGNORECASE,
 )
+
+# Double numéro : "8/10 rue X", "8-10 rue X", "8 et 10 rue X", "8 à 10 rue X",
+# "8 bis/10 rue X"... — partout dans l'adresse, pas seulement en tête.
+_MULTI_NUM_RE = re.compile(
+    r"(?<![\d/])"                                 # pas précédé d'un chiffre ou d'un /
+    r"(\d+(?:\s+(?:bis|ter|quater))?)"            # group 1 : premier numéro (+suffixe)
+    r"\s*(?:[/\-]|\s+(?:et|à|a)\s+)\s*"           # séparateur : / - ' et ' ' à ' ' a '
+    r"\d+(?:\s+(?:bis|ter|quater))?"              # second numéro (à supprimer)
+    r"(?=\s+\D|$)",                                # suivi d'un espace+non-chiffre ou fin
+    flags=re.IGNORECASE,
+)
+
+
+def _strip_emmy_metadata(addr: str) -> str:
+    """Supprime les annotations Emmy/cadastre (Parcelle, références cadastrales)."""
+    return _METADATA_RE.sub(" ", addr)
+
+
+def _dedupe_consecutive(addr: str) -> str:
+    """Supprime une répétition consécutive de ≥3 tokens identiques.
+
+    Itère jusqu'à stabilisation pour gérer les triples (A B C A B C A B C → A B C).
+        "42 BOULEVARD JEROME 42 BOULEVARD JEROME 58000 Nevers"
+            → "42 BOULEVARD JEROME 58000 Nevers"
+    """
+    prev = None
+    while addr != prev:
+        prev = addr
+        tokens = addr.split()
+        n = len(tokens)
+        found = False
+        for w in range(min(n // 2, 10), 2, -1):
+            for i in range(n - 2 * w + 1):
+                if tokens[i : i + w] == tokens[i + w : i + 2 * w]:
+                    addr = " ".join(tokens[: i + w] + tokens[i + 2 * w :])
+                    found = True
+                    break
+            if found:
+                break
+    return addr
 
 
 def normalize_address(addr: str) -> str:
     """Normalise une adresse pour le géocodage BAN.
 
-    Transforme les doubles numéros en tête (cas fréquent dans Emmy) :
-        "8/10 rue des Champs"     → "8 rue des Champs"
-        "8-10 rue X"              → "8 rue X"
-        "8 et 10 rue X"           → "8 rue X"
-        "8 bis/10 rue X"          → "8 bis rue X"
-        "12 rue saint-michel"     → "12 rue saint-michel"  (pas de double numéro)
+    Étapes :
+    1. Supprime les annotations Emmy/cadastre ("Parcelle : 000/AB/0119", etc.).
+    2. Réduit les doubles numéros : "8/10", "8-10", "8 et 10", "8 à 10" → "8".
+       Le suffixe bis/ter/quater du premier numéro est préservé.
+    3. Supprime les répétitions consécutives de portions d'adresse
+       (cas Emmy : la même adresse dupliquée dans deux colonnes mappées).
+    4. Normalise les espaces multiples.
 
-    Le suffixe bis/ter/quater du premier numéro est préservé.
+    Exemples :
+        "42 BOULEVARD JEROME - Parcelle : 000, CR ,0694 42 BOULEVARD JEROME 58000 Nevers"
+            → "42 BOULEVARD JEROME 58000 Nevers"
+        "8/10 rue des Champs 75008 Paris"
+            → "8 rue des Champs 75008 Paris"
+        "12 rue saint-michel"
+            → "12 rue saint-michel"  (inchangé)
     """
     if not addr:
         return addr
-    out = _MULTI_NUM_RE.sub(r"\1", addr)
-    # Normalise les espaces multiples
-    return re.sub(r"\s+", " ", out).strip()
+    out = _strip_emmy_metadata(addr)
+    out = _MULTI_NUM_RE.sub(r"\1", out)
+    out = re.sub(r"\s+", " ", out).strip()
+    out = _dedupe_consecutive(out)
+    return out
 
 
 def build_address_series(

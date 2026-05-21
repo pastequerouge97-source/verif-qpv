@@ -594,6 +594,10 @@ with tab_lot:
                         st.error(f"Échec du géocodage batch : {e}")
                         st.stop()
 
+                # Initialisation par défaut de source_geocodage = "BAN" (ou "" si pas géocodé)
+                geo_df = geo_df.copy()
+                geo_df["source_geocodage"] = geo_df["lat"].notna().map({True: "BAN", False: ""})
+
                 # Fallback cadastre pour les lignes avec score faible et parcelle disponible
                 if use_cadastre_fallback:
                     score_num = pd.to_numeric(geo_df["score_ban"], errors="coerce")
@@ -626,9 +630,6 @@ with tab_lot:
                             progress_cb=_cad_cb,
                         )
                         cad_progress.empty()
-                else:
-                    geo_df = geo_df.copy()
-                    geo_df["source_geocodage"] = geo_df["lat"].notna().map({True: "BAN", False: ""})
 
                 with st.spinner("Test point-dans-polygone QPV…"):
                     qpv_df = find_qpv_batch(

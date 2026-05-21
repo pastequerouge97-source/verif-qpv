@@ -208,6 +208,55 @@ def fmt_score(s: Optional[float]) -> str:
     return f"{badge} {pct} %"
 
 
+SCORE_REVIEW_THRESHOLD = 0.70
+
+
+def _color_score_cell(val):
+    """Pandas Styler : colore une cellule score_ban selon la fiabilité du géocodage."""
+    if val is None or (isinstance(val, float) and pd.isna(val)) or val == "":
+        return "background-color: #6c757d; color: white"
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return ""
+    if v >= 0.80:
+        return "background-color: #d4edda; color: #155724"  # vert
+    if v >= SCORE_REVIEW_THRESHOLD:
+        return "background-color: #fff3cd; color: #856404"  # jaune
+    return "background-color: #f8d7da; color: #721c24; font-weight: 600"  # rouge
+
+
+def render_low_score_alert(enriched: pd.DataFrame) -> None:
+    """Affiche une alerte rouge et la liste des adresses à revérifier (score < seuil)."""
+    score_num = pd.to_numeric(enriched["score_ban"], errors="coerce")
+    low_mask = score_num < SCORE_REVIEW_THRESHOLD
+    low_df = enriched.loc[low_mask].copy()
+    low_df["score_ban"] = score_num.loc[low_mask]
+    low_df = low_df.sort_values("score_ban", ascending=True)
+
+    if low_df.empty:
+        return
+
+    st.error(
+        f"⚠️ **{len(low_df)} adresse(s) à vérifier manuellement** — "
+        f"le score de géocodage est inférieur à {SCORE_REVIEW_THRESHOLD:.2f}, "
+        f"l'API BAN a fait au mieux mais l'adresse retrouvée ne correspond peut-être "
+        f"pas à celle saisie. Le verdict QPV de ces lignes peut donc être incorrect. "
+        f"Recommandation : recouper sur [sig.ville.gouv.fr](https://sig.ville.gouv.fr) "
+        f"pour les cas à enjeu."
+    )
+    cols_to_show = [c for c in [
+        "adresse_envoyee", "adresse_ban", "score_ban", "en_qpv", "code_qpv", "nom_qpv"
+    ] if c in low_df.columns]
+    with st.expander(
+        f"📋 Voir les {len(low_df)} adresse(s) à revérifier", expanded=True
+    ):
+        st.dataframe(
+            low_df[cols_to_show].style.map(_color_score_cell, subset=["score_ban"]),
+            use_container_width=True,
+        )
+
+
 def _qpv_geojson_subset(gdf, lat: float, lon: float, radius_deg: float = 0.05):
     """Renvoie un GeoJSON des polygones autour d'un point pour affichage."""
     bbox = (lon - radius_deg, lat - radius_deg, lon + radius_deg, lat + radius_deg)
@@ -270,13 +319,24 @@ with tab_unitaire:
                 if geo_res["label"]:
                     st.caption(geo_res["label"])
             else:
+                score = geo_res["score"]
+                if score is not None and score < SCORE_REVIEW_THRESHOLD:
+                    st.error(
+                        f"⚠️ **Score de géocodage faible ({score:.2f})** — l'API BAN a "
+                        f"retourné une adresse, mais avec une confiance limitée. "
+                        f"Vérifie l'adresse normalisée ci-dessous : si elle ne correspond "
+                        f"pas exactement à ce que tu cherchais, le verdict QPV n'est "
+                        f"**pas fiable**. Recoupe sur "
+                        f"[sig.ville.gouv.fr](https://sig.ville.gouv.fr) si nécessaire."
+                    )
+
                 c1, c2 = st.columns([1, 2])
                 with c1:
                     if en_qpv:
                         st.success("✅ **En QPV**")
                     else:
                         st.info("➖ **Hors QPV**")
-                    st.metric("Score BAN", fmt_score(geo_res["score"]))
+                    st.metric("Score BAN", fmt_score(score))
                 with c2:
                     st.write(f"**Adresse normalisée (BAN)** : {geo_res['label']}")
                     st.write(f"**Coordonnées** : {geo_res['lat']:.6f}, {geo_res['lon']:.6f}")
@@ -530,21 +590,29 @@ with tab_lot:
             nb_non = int((enriched["en_qpv"] == "Non").sum())
             nb_err = int((enriched["en_qpv"] == "Adresse non géocodée").sum())
             score_num = pd.to_numeric(enriched["score_ban"], errors="coerce")
-            nb_low = int((score_num < 0.7).sum())
+            nb_low = int((score_num < SCORE_REVIEW_THRESHOLD).sum())
 
             st.success(f"Traitement terminé en **{elapsed:.1f} s** sur {len(enriched)} ligne(s).")
             k1, k2, k3, k4 = st.columns(4)
             k1.metric("En QPV", nb_oui)
             k2.metric("Hors QPV", nb_non)
             k3.metric("Non géocodées", nb_err)
-            k4.metric("Score < 0.7", nb_low, help="À revérifier manuellement")
+            k4.metric(
+                f"Score < {SCORE_REVIEW_THRESHOLD:.2f}",
+                nb_low,
+                help="Adresses à revérifier manuellement (géocodage incertain)",
+            )
+
+            # ── Alerte rouge proéminente pour les scores faibles
+            render_low_score_alert(enriched)
 
             st.markdown("##### Résultat")
+            result_cols = [
+                "adresse_envoyee", "adresse_ban", "en_qpv",
+                "code_qpv", "nom_qpv", "score_ban",
+            ]
             st.dataframe(
-                enriched[[
-                    "adresse_envoyee", "adresse_ban", "en_qpv",
-                    "code_qpv", "nom_qpv", "score_ban",
-                ]],
+                enriched[result_cols].style.map(_color_score_cell, subset=["score_ban"]),
                 use_container_width=True,
             )
 

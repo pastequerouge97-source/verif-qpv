@@ -124,6 +124,10 @@ Les tests couvrent les fonctions cœur (`find_qpv`, `find_qpv_batch`, `geocode`,
 - API BAN — [adresse.data.gouv.fr](https://adresse.data.gouv.fr)
 - Référentiel QPV — [data.gouv.fr](https://www.data.gouv.fr/datasets/quartiers-prioritaires-de-la-politique-de-la-ville-qpv)
 
+## Auteur
+
+Réalisé par **medidev34**.
+
 ## Licence
 
-[MIT](LICENSE)
+[MIT](LICENSE) — © 2026 medidev34

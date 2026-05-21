@@ -3,6 +3,9 @@
 """
 Interface Streamlit pour la vérification QPV.
 
+Réalisé par medidev34 — © 2026 — Licence MIT
+Dépôt : https://github.com/pastequerouge97-source/verif-qpv
+
 Lancement :
     streamlit run app.py
 """
@@ -191,6 +194,9 @@ with st.sidebar:
         "**Source officielle**  \n"
         f"[Référentiel QPV — data.gouv.fr](https://www.data.gouv.fr/datasets/{QPV_DATASET_SLUG})"
     )
+
+    st.divider()
+    st.caption("Réalisé par **medidev34** · © 2026 · [MIT](https://github.com/pastequerouge97-source/verif-qpv/blob/main/LICENSE)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

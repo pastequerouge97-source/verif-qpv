@@ -4,6 +4,9 @@
 verif_qpv.py — Vérification automatique de l'appartenance à un QPV
 ==================================================================
 
+Réalisé par medidev34 — © 2026 — Licence MIT
+Dépôt : https://github.com/pastequerouge97-source/verif-qpv
+
 Pour chaque ligne d'un CSV (typiquement un export Emmy), le script :
   1. Reconstitue l'adresse à partir de plusieurs colonnes (num, rue, CP, ville).
   2. Géocode l'adresse via l'API publique BAN (api-adresse.data.gouv.fr).

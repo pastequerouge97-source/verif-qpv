@@ -22,12 +22,15 @@ import requests
 import streamlit as st
 
 from verif_qpv import (
+    FALLBACK_SCORE_THRESHOLD,
     QPV_CODE_CANDIDATES,
     QPV_NAME_CANDIDATES,
     QPV_DATASET_SLUG,
+    apply_cadastre_fallback,
     build_address_series,
     detect_col,
     download_qpv_dataset,
+    extract_parcelle_ref,
     find_qpv,
     find_qpv_batch,
     geocode,
@@ -303,24 +306,60 @@ with tab_unitaire:
     if go:
         raw_addr = " ".join(x.strip() for x in [u_numero, u_rue, u_cp, u_ville] if x.strip())
         addr = normalize_address(raw_addr)
+        # Extraction parcelle depuis la voie/rue saisie (avant normalisation)
+        parc_ref = extract_parcelle_ref(u_rue)
         if not addr:
             st.error("Saisis au moins une partie de l'adresse.")
         else:
             if addr != raw_addr:
-                st.caption(f"Adresse normalisée : `{addr}` (double numéro détecté)")
+                st.caption(f"Adresse normalisée : `{addr}` (annotations / doubles numéros nettoyés)")
             with st.spinner("Géocodage et test QPV…"):
                 geo_res = _geocode_cached(addr, u_cp.strip(), "")
-                en_qpv, code_q, nom_q = find_qpv(
-                    geo_res["lat"], geo_res["lon"], qpv_gdf, code_col, name_col, sindex
-                )
 
-            if geo_res["lat"] is None:
-                st.error("❌ Adresse non trouvée par la BAN. Vérifie la saisie.")
+            source = "BAN" if geo_res["lat"] is not None else ""
+            score = geo_res["score"]
+            lat, lon = geo_res["lat"], geo_res["lon"]
+            label = geo_res["label"]
+
+            # Fallback cadastre si score faible et parcelle dispo
+            need_fallback = (
+                parc_ref is not None
+                and (lat is None or (score is not None and score < FALLBACK_SCORE_THRESHOLD))
+            )
+            if need_fallback:
+                with st.spinner("Score BAN faible — tentative via le cadastre IGN…"):
+                    import requests as _req
+                    from verif_qpv import lookup_commune_insee, lookup_parcelle_coords
+                    s = _req.Session()
+                    insee = lookup_commune_insee(u_cp.strip(), u_ville.strip(), session=s)
+                    if insee:
+                        coords = lookup_parcelle_coords(
+                            insee, parc_ref["section"], parc_ref["numero"], session=s
+                        )
+                        if coords:
+                            lat, lon = coords["lat"], coords["lon"]
+                            label = (
+                                f"Parcelle {parc_ref['section']}-{parc_ref['numero']} "
+                                f"(commune INSEE {insee})"
+                            )
+                            source = "Cadastre"
+
+            en_qpv, code_q, nom_q = find_qpv(
+                lat, lon, qpv_gdf, code_col, name_col, sindex
+            )
+
+            if lat is None:
+                st.error("❌ Adresse non trouvée. Ni la BAN ni le cadastre n'ont pu localiser ce point.")
                 if geo_res["label"]:
                     st.caption(geo_res["label"])
             else:
-                score = geo_res["score"]
-                if score is not None and score < SCORE_REVIEW_THRESHOLD:
+                if source == "Cadastre":
+                    st.info(
+                        f"🏞️ **Géocodage via le cadastre IGN** — la BAN avait un score trop "
+                        f"faible (ou n'a rien trouvé), j'ai utilisé la référence parcelle "
+                        f"`{parc_ref['section']}-{parc_ref['numero']}` à la place."
+                    )
+                elif score is not None and score < SCORE_REVIEW_THRESHOLD:
                     st.error(
                         f"⚠️ **Score de géocodage faible ({score:.2f})** — l'API BAN a "
                         f"retourné une adresse, mais avec une confiance limitée. "
@@ -336,13 +375,19 @@ with tab_unitaire:
                         st.success("✅ **En QPV**")
                     else:
                         st.info("➖ **Hors QPV**")
-                    st.metric("Score BAN", fmt_score(score))
+                    if source == "Cadastre":
+                        st.metric("Source", "🏞️ Cadastre")
+                    else:
+                        st.metric("Score BAN", fmt_score(score))
                 with c2:
-                    st.write(f"**Adresse normalisée (BAN)** : {geo_res['label']}")
-                    st.write(f"**Coordonnées** : {geo_res['lat']:.6f}, {geo_res['lon']:.6f}")
+                    st.write(f"**Adresse / point retenu** : {label}")
+                    st.write(f"**Coordonnées** : {lat:.6f}, {lon:.6f}")
                     if en_qpv:
                         st.write(f"**Code QPV** : `{code_q}`")
                         st.write(f"**Nom du quartier** : {nom_q}")
+
+                # Mise à jour pour la carte
+                geo_res = {"lat": lat, "lon": lon, "label": label, "score": score}
 
                 # Carte pydeck avec polygones QPV autour du point
                 geojson = _qpv_geojson_subset(qpv_gdf, geo_res["lat"], geo_res["lon"])
@@ -496,11 +541,24 @@ with tab_lot:
                 "sont automatiquement réduits au premier."
             )
 
-        use_batch = st.toggle(
-            "⚡ Mode batch (recommandé)",
-            value=True,
-            help="Un seul appel à l'API BAN au lieu d'un par ligne. ~50× plus rapide.",
-        )
+        c_opt1, c_opt2 = st.columns(2)
+        with c_opt1:
+            use_batch = st.toggle(
+                "⚡ Mode batch (recommandé)",
+                value=True,
+                help="Un seul appel à l'API BAN au lieu d'un par ligne. ~50× plus rapide.",
+            )
+        with c_opt2:
+            use_cadastre_fallback = st.toggle(
+                "🏞️ Fallback cadastre (lieux-dits)",
+                value=True,
+                help=(
+                    f"Si la BAN renvoie un score < {FALLBACK_SCORE_THRESHOLD:.2f} et que "
+                    f"l'adresse contient une référence parcelle (`Parcelle : 000/AB/0119`), "
+                    f"tente une seconde recherche via l'API Cadastre IGN. Utile pour "
+                    f"les lieux-dits sans voie nommée. ~0.2s/parcelle interrogée."
+                ),
+            )
 
         if st.button("🚀 Lancer le traitement", type="primary", disabled=not ready):
             t0 = time.time()
@@ -508,6 +566,10 @@ with tab_lot:
 
             address_cols = [c for c in [col_num, col_rue, col_cp, col_ville] if c != "(aucune)"]
             postcode_col = col_cp if col_cp != "(aucune)" else ""
+
+            # Extrait la référence parcelle de la voie/rue AVANT normalisation
+            # (la normalisation supprime ces annotations).
+            parcelles = df[col_rue].fillna("").astype(str).map(extract_parcelle_ref)
 
             # Adresse normalisée pour traçabilité (mêmes règles que la BAN reçoit)
             addr_series = build_address_series(df, address_cols, normalize=True)
@@ -525,6 +587,42 @@ with tab_lot:
                     except Exception as e:
                         st.error(f"Échec du géocodage batch : {e}")
                         st.stop()
+
+                # Fallback cadastre pour les lignes avec score faible et parcelle disponible
+                if use_cadastre_fallback:
+                    score_num = pd.to_numeric(geo_df["score_ban"], errors="coerce")
+                    n_fallback = int(
+                        ((score_num < FALLBACK_SCORE_THRESHOLD) | geo_df["lat"].isna())
+                        .pipe(lambda s: s & parcelles.apply(lambda p: isinstance(p, dict)))
+                        .sum()
+                    )
+                    if n_fallback > 0:
+                        cad_progress = st.progress(
+                            0.0, text=f"Fallback cadastre : {n_fallback} parcelle(s) à interroger…"
+                        )
+                        def _cad_cb(done, total):
+                            cad_progress.progress(
+                                min(done / total, 1.0),
+                                text=f"Fallback cadastre : {done}/{total}",
+                            )
+                        postcodes = (
+                            df[col_cp].fillna("").astype(str)
+                            if col_cp != "(aucune)" else pd.Series([""] * len(df), index=df.index)
+                        )
+                        cities = (
+                            df[col_ville].fillna("").astype(str)
+                            if col_ville != "(aucune)" else pd.Series([""] * len(df), index=df.index)
+                        )
+                        geo_df = apply_cadastre_fallback(
+                            geo_df, parcelles, postcodes, cities,
+                            score_threshold=FALLBACK_SCORE_THRESHOLD,
+                            session=session,
+                            progress_cb=_cad_cb,
+                        )
+                        cad_progress.empty()
+                else:
+                    geo_df = geo_df.copy()
+                    geo_df["source_geocodage"] = geo_df["lat"].notna().map({True: "BAN", False: ""})
 
                 with st.spinner("Test point-dans-polygone QPV…"):
                     qpv_df = find_qpv_batch(
@@ -546,6 +644,7 @@ with tab_lot:
                 enriched["lat"]             = geo_df["lat"].values
                 enriched["lon"]             = geo_df["lon"].values
                 enriched["score_ban"]       = geo_df["score_ban"].values
+                enriched["source_geocodage"] = geo_df["source_geocodage"].values
                 enriched["en_qpv"]          = statut
                 enriched["code_qpv"]        = qpv_df["code_qpv"].values
                 enriched["nom_qpv"]         = qpv_df["nom_qpv"].values
@@ -572,6 +671,7 @@ with tab_lot:
                         "lat":             geo_res["lat"],
                         "lon":             geo_res["lon"],
                         "score_ban":       geo_res["score"],
+                        "source_geocodage": "BAN" if geo_res["lat"] is not None else "",
                         "en_qpv":          st_v,
                         "code_qpv":        code_q,
                         "nom_qpv":         nom_q,
@@ -606,11 +706,23 @@ with tab_lot:
             # ── Alerte rouge proéminente pour les scores faibles
             render_low_score_alert(enriched)
 
+            # Si du fallback cadastre a eu lieu, on l'annonce
+            if "source_geocodage" in enriched.columns:
+                n_cad = int((enriched["source_geocodage"] == "Cadastre").sum())
+                if n_cad > 0:
+                    st.info(
+                        f"🏞️ **{n_cad} adresse(s) géocodée(s) via le cadastre IGN** "
+                        f"(la BAN avait un score trop faible). Visibles dans la colonne "
+                        f"`source_geocodage` ci-dessous."
+                    )
+
             st.markdown("##### Résultat")
             result_cols = [
                 "adresse_envoyee", "adresse_ban", "en_qpv",
                 "code_qpv", "nom_qpv", "score_ban",
             ]
+            if "source_geocodage" in enriched.columns:
+                result_cols.append("source_geocodage")
             st.dataframe(
                 enriched[result_cols].style.map(_color_score_cell, subset=["score_ban"]),
                 use_container_width=True,

@@ -50,7 +50,7 @@ from typing import Optional
 import pandas as pd
 import requests
 import geopandas as gpd
-from shapely.geometry import Point
+from shapely.geometry import Point, shape
 
 
 # ---------------------------------------------------------------------------
@@ -59,10 +59,13 @@ from shapely.geometry import Point
 
 BAN_URL = "https://api-adresse.data.gouv.fr/search/"
 BAN_CSV_URL = "https://api-adresse.data.gouv.fr/search/csv/"
+APICARTO_PARCELLE_URL = "https://apicarto.ign.fr/api/cadastre/parcelle"
 REQUEST_TIMEOUT = 10           # secondes (mode unitaire)
 BATCH_TIMEOUT = 180            # secondes (mode batch, plus long sur gros fichier)
 BATCH_MAX_ROWS = 10_000        # on découpe au-delà pour rester sous les limites
 SLEEP_BETWEEN_REQUESTS = 0.05  # l'API BAN tolère ~50 req/s ; on reste prudent
+SLEEP_BETWEEN_CADASTRE = 0.2   # API Carto plus stricte, on espace
+FALLBACK_SCORE_THRESHOLD = 0.70  # en dessous, on tente le fallback cadastre si parcelle dispo
 
 # Référentiel QPV — data.gouv.fr
 # (l'API v1 renvoie les resources en liste, contrairement à v2 où c'est une sous-ressource)
@@ -121,6 +124,39 @@ _MULTI_NUM_RE = re.compile(
     r"(?=\s+\D|$)",                                # suivi d'un espace+non-chiffre ou fin
     flags=re.IGNORECASE,
 )
+
+
+# Référence cadastrale dans l'adresse Emmy : "Parcelle : 000/AB/0119",
+# "Parcelle : 000 , CR ,0694", "Parcelle : 000 / DX / 0072", etc.
+# Format attendu : prefix (1-3 chiffres) / section (1-3 alphanum) / numéro (1-4 chiffres)
+_PARCELLE_REF_RE = re.compile(
+    r"parcelles?\s*:?\s*"
+    r"(\d{1,3})\s*[/,\-\s]+\s*"
+    r"([A-Z0-9]{1,3})\s*[/,\-\s]+\s*"
+    r"(\d{1,4})\b",
+    flags=re.IGNORECASE,
+)
+
+
+def extract_parcelle_ref(addr: str) -> Optional[dict]:
+    """Extrait la référence cadastrale (préfixe/section/numéro) d'une adresse Emmy.
+
+    Reconnaît les formats : "Parcelle : 000/AB/0119", "Parcelle : 000 , CR ,0694",
+    "Parcelle : 000 / DX / 0072".
+
+    Renvoie {"prefixe": "000", "section": "AB", "numero": "0119"} ou None
+    si aucune référence n'est trouvée. Le numéro est complété à 4 chiffres
+    (API Carto attend ce format).
+    """
+    if not addr:
+        return None
+    m = _PARCELLE_REF_RE.search(addr)
+    if not m:
+        return None
+    prefixe = m.group(1).zfill(3)
+    section = m.group(2).upper()
+    numero = m.group(3).zfill(4)
+    return {"prefixe": prefixe, "section": section, "numero": numero}
 
 
 def _strip_emmy_metadata(addr: str) -> str:
@@ -346,6 +382,155 @@ def _geocode_one_chunk(
         "lon": pd.to_numeric(result.get("longitude", ""), errors="coerce"),
         "score_ban": pd.to_numeric(result.get("result_score", ""), errors="coerce"),
     })
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Fallback cadastre — API Carto IGN
+# ---------------------------------------------------------------------------
+
+def lookup_commune_insee(
+    postcode: str,
+    city: str,
+    session: Optional[requests.Session] = None,
+) -> Optional[str]:
+    """Récupère le code INSEE d'une commune via la BAN (endpoint type=municipality).
+
+    Renvoie le code INSEE (5 chiffres) ou None si introuvable.
+    """
+    if not (postcode or city):
+        return None
+    if session is None:
+        session = requests.Session()
+    q = (postcode + " " + city).strip() if postcode and city else (postcode or city).strip()
+    params = {"q": q, "limit": 1, "type": "municipality"}
+    try:
+        r = session.get(BAN_URL, params=params, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        return None
+    feats = data.get("features") or []
+    if not feats:
+        return None
+    return feats[0].get("properties", {}).get("citycode")
+
+
+def lookup_parcelle_coords(
+    code_insee: str,
+    section: str,
+    numero: str,
+    session: Optional[requests.Session] = None,
+) -> Optional[dict]:
+    """Appelle l'API Carto Cadastre IGN et renvoie le centroïde de la parcelle.
+
+    Renvoie {"lat": float, "lon": float} ou None si la parcelle n'existe pas
+    ou que l'API échoue.
+    """
+    if not (code_insee and section and numero):
+        return None
+    if session is None:
+        session = requests.Session()
+    # L'API Carto attend la section sur 2 caractères (complétée par 0 si besoin)
+    section_norm = section.zfill(2) if len(section) < 2 else section
+    params = {
+        "code_insee": code_insee,
+        "section": section_norm,
+        "numero": numero,
+    }
+    try:
+        r = session.get(APICARTO_PARCELLE_URL, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        return None
+    features = data.get("features") or []
+    if not features:
+        return None
+    geom = features[0].get("geometry")
+    if not geom:
+        return None
+    try:
+        poly = shape(geom)
+        centroid = poly.centroid
+        return {"lat": float(centroid.y), "lon": float(centroid.x)}
+    except Exception:
+        return None
+
+
+def apply_cadastre_fallback(
+    geo_df: pd.DataFrame,
+    parcelles: pd.Series,
+    postcodes: pd.Series,
+    cities: pd.Series,
+    score_threshold: float = FALLBACK_SCORE_THRESHOLD,
+    session: Optional[requests.Session] = None,
+    progress_cb=None,
+) -> pd.DataFrame:
+    """Pour les lignes avec un score BAN < seuil et une parcelle extraite,
+    tente de retrouver les coordonnées via l'API Carto Cadastre.
+
+    Entrées (alignées par index) :
+        geo_df    : DataFrame retourné par geocode_batch_csv
+                    (colonnes lat, lon, score_ban, adresse_envoyee, adresse_ban)
+        parcelles : Series de dicts {prefixe, section, numero} ou None
+        postcodes : Series de codes postaux (str)
+        cities    : Series de villes (str)
+
+    Renvoie un DataFrame copie de geo_df avec :
+        - lat/lon remplacées si fallback réussi
+        - colonne 'source_geocodage' ajoutée : "BAN", "Cadastre",
+          "BAN (cadastre indisponible)" ou "" si pas de géocodage du tout
+    """
+    if session is None:
+        session = requests.Session()
+
+    out = geo_df.copy()
+    out["source_geocodage"] = ""
+
+    # Source par défaut selon le résultat BAN
+    has_ban_result = out["lat"].notna()
+    out.loc[has_ban_result, "source_geocodage"] = "BAN"
+
+    # Candidats au fallback : score < seuil ET parcelle extraite
+    score_num = pd.to_numeric(out["score_ban"], errors="coerce")
+    need_fallback = (score_num < score_threshold) | out["lat"].isna()
+    has_parcelle = parcelles.apply(lambda x: isinstance(x, dict))
+    candidates = out.index[need_fallback & has_parcelle]
+
+    if len(candidates) == 0:
+        return out
+
+    insee_cache: dict[tuple[str, str], Optional[str]] = {}
+    done = 0
+    total = len(candidates)
+    for idx in candidates:
+        cp = str(postcodes.loc[idx]).strip() if idx in postcodes.index else ""
+        ville = str(cities.loc[idx]).strip() if idx in cities.index else ""
+        parc = parcelles.loc[idx]
+
+        cache_key = (cp, ville.lower())
+        if cache_key not in insee_cache:
+            insee_cache[cache_key] = lookup_commune_insee(cp, ville, session=session)
+        insee = insee_cache[cache_key]
+
+        coords = None
+        if insee:
+            coords = lookup_parcelle_coords(
+                insee, parc["section"], parc["numero"], session=session
+            )
+        if coords is not None:
+            out.at[idx, "lat"] = coords["lat"]
+            out.at[idx, "lon"] = coords["lon"]
+            out.at[idx, "source_geocodage"] = "Cadastre"
+        elif out.at[idx, "source_geocodage"] == "BAN":
+            out.at[idx, "source_geocodage"] = "BAN (cadastre indisponible)"
+
+        done += 1
+        if progress_cb is not None:
+            progress_cb(done, total)
+        time.sleep(SLEEP_BETWEEN_CADASTRE)
+
     return out
 
 

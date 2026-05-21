@@ -10,15 +10,20 @@ import pytest
 from shapely.geometry import Polygon
 
 from verif_qpv import (
+    FALLBACK_SCORE_THRESHOLD,
     QPV_CODE_CANDIDATES,
     QPV_NAME_CANDIDATES,
     _pick_shapefile_in_zip,
+    apply_cadastre_fallback,
     build_address_series,
     detect_col,
+    extract_parcelle_ref,
     find_qpv,
     find_qpv_batch,
     geocode,
     geocode_batch_csv,
+    lookup_commune_insee,
+    lookup_parcelle_coords,
     normalize_address,
     pick_shapefile_resource,
 )
@@ -448,3 +453,212 @@ class TestBuildAddressSeries:
     def test_raises_on_empty_cols(self):
         with pytest.raises(ValueError):
             build_address_series(pd.DataFrame({"a": [1]}), [])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# extract_parcelle_ref
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestExtractParcelleRef:
+    @pytest.mark.parametrize("addr, expected", [
+        (
+            "7 rue de corse - Parcelle : 000/DX/0072 93600 AULNAY",
+            {"prefixe": "000", "section": "DX", "numero": "0072"},
+        ),
+        (
+            "Parcelle : 000 , CR ,0694 58000 Nevers",
+            {"prefixe": "000", "section": "CR", "numero": "0694"},
+        ),
+        (
+            "39 AVENUE JEAN MOULIN - Parcelle : 000 / AB / 0119 24700",
+            {"prefixe": "000", "section": "AB", "numero": "0119"},
+        ),
+    ])
+    def test_extracts(self, addr, expected):
+        assert extract_parcelle_ref(addr) == expected
+
+    @pytest.mark.parametrize("addr", [
+        "",
+        "12 rue saint-michel 75001 Paris",   # pas de parcelle
+        "Parcelle : trop court",              # pas de format reconnu
+    ])
+    def test_none_when_no_ref(self, addr):
+        assert extract_parcelle_ref(addr) is None
+
+    def test_pads_numero_to_4_digits(self):
+        result = extract_parcelle_ref("Parcelle : 000/AB/9")
+        assert result["numero"] == "0009"
+
+    def test_uppercases_section(self):
+        result = extract_parcelle_ref("Parcelle : 000/ab/0119")
+        assert result["section"] == "AB"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# lookup_commune_insee (BAN mockée)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestLookupCommuneInsee:
+    def _mock_session(self, citycode):
+        sess = MagicMock()
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = {
+            "features": [{"properties": {"citycode": citycode}}] if citycode else []
+        }
+        sess.get.return_value = resp
+        return sess
+
+    def test_returns_insee_code(self):
+        sess = self._mock_session("75056")
+        assert lookup_commune_insee("75001", "Paris", session=sess) == "75056"
+
+    def test_returns_none_if_no_match(self):
+        sess = self._mock_session(None)
+        assert lookup_commune_insee("99999", "Inconnu", session=sess) is None
+
+    def test_returns_none_on_empty_input(self):
+        sess = MagicMock()
+        assert lookup_commune_insee("", "", session=sess) is None
+        sess.get.assert_not_called()
+
+    def test_passes_type_municipality(self):
+        sess = self._mock_session("75056")
+        lookup_commune_insee("75001", "Paris", session=sess)
+        params = sess.get.call_args.kwargs["params"]
+        assert params["type"] == "municipality"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# lookup_parcelle_coords (API Carto mockée)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestLookupParcelleCoords:
+    def _mock_session(self, geojson_features):
+        sess = MagicMock()
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = {"features": geojson_features}
+        sess.get.return_value = resp
+        return sess
+
+    def test_returns_centroid(self):
+        # Polygone carré 2.30,48.85 – 2.40,48.90 → centroïde 2.35, 48.875
+        features = [{
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[
+                    [2.30, 48.85], [2.40, 48.85],
+                    [2.40, 48.90], [2.30, 48.90], [2.30, 48.85],
+                ]],
+            }
+        }]
+        sess = self._mock_session(features)
+        coords = lookup_parcelle_coords("75056", "AB", "0119", session=sess)
+        assert coords is not None
+        assert abs(coords["lat"] - 48.875) < 1e-6
+        assert abs(coords["lon"] - 2.35) < 1e-6
+
+    def test_returns_none_when_no_feature(self):
+        sess = self._mock_session([])
+        assert lookup_parcelle_coords("75056", "AB", "0119", session=sess) is None
+
+    def test_pads_section_to_2_chars(self):
+        sess = self._mock_session([])
+        lookup_parcelle_coords("75056", "A", "0119", session=sess)
+        params = sess.get.call_args.kwargs["params"]
+        assert params["section"] == "0A"
+
+    def test_returns_none_on_missing_args(self):
+        sess = MagicMock()
+        assert lookup_parcelle_coords("", "AB", "0119", session=sess) is None
+        sess.get.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# apply_cadastre_fallback
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestApplyCadastreFallback:
+    def test_replaces_low_score_rows_with_cadastre_coords(self, monkeypatch):
+        geo_df = pd.DataFrame({
+            "adresse_envoyee": ["rue X 75001 Paris", "lieu-dit 24700"],
+            "adresse_ban":     ["1 rue X 75001 Paris", "?"],
+            "lat":             [48.86, 45.10],
+            "lon":             [2.35, 0.50],
+            "score_ban":       [0.92, 0.40],     # ligne 1 OK, ligne 2 < seuil
+        })
+        parcelles = pd.Series([
+            None,
+            {"prefixe": "000", "section": "AB", "numero": "0119"},
+        ])
+        postcodes = pd.Series(["75001", "24700"])
+        cities = pd.Series(["Paris", "Montpon-Ménestérol"])
+
+        # Mock les lookups
+        from verif_qpv import lookup_commune_insee, lookup_parcelle_coords
+        called_with = {}
+
+        def fake_insee(cp, ville, session=None):
+            called_with["insee"] = (cp, ville)
+            return "24279"
+
+        def fake_parcelle(insee, section, numero, session=None):
+            called_with["parcelle"] = (insee, section, numero)
+            return {"lat": 45.20, "lon": 0.55}
+
+        monkeypatch.setattr("verif_qpv.lookup_commune_insee", fake_insee)
+        monkeypatch.setattr("verif_qpv.lookup_parcelle_coords", fake_parcelle)
+        monkeypatch.setattr("verif_qpv.time.sleep", lambda x: None)
+
+        out = apply_cadastre_fallback(
+            geo_df, parcelles, postcodes, cities,
+            score_threshold=FALLBACK_SCORE_THRESHOLD,
+            session=MagicMock(),
+        )
+
+        # Ligne 0 inchangée (BAN bon)
+        assert out.loc[0, "source_geocodage"] == "BAN"
+        assert out.loc[0, "lat"] == 48.86
+        # Ligne 1 remplacée par cadastre
+        assert out.loc[1, "source_geocodage"] == "Cadastre"
+        assert out.loc[1, "lat"] == 45.20
+        assert out.loc[1, "lon"] == 0.55
+        assert called_with["parcelle"] == ("24279", "AB", "0119")
+
+    def test_no_parcelle_keeps_ban_result(self, monkeypatch):
+        geo_df = pd.DataFrame({
+            "adresse_envoyee": ["X"],
+            "adresse_ban":     ["X"],
+            "lat":             [48.86],
+            "lon":             [2.35],
+            "score_ban":       [0.30],
+        })
+        parcelles = pd.Series([None])  # pas de parcelle
+        postcodes = pd.Series([""])
+        cities = pd.Series([""])
+        monkeypatch.setattr("verif_qpv.time.sleep", lambda x: None)
+        out = apply_cadastre_fallback(geo_df, parcelles, postcodes, cities, session=MagicMock())
+        # Aucune tentative de cadastre, mais on garde "BAN" comme source
+        assert out.loc[0, "source_geocodage"] == "BAN"
+        assert out.loc[0, "lat"] == 48.86
+
+    def test_marks_failed_fallback(self, monkeypatch):
+        geo_df = pd.DataFrame({
+            "adresse_envoyee": ["X"],
+            "adresse_ban":     ["X"],
+            "lat":             [48.86],
+            "lon":             [2.35],
+            "score_ban":       [0.30],
+        })
+        parcelles = pd.Series([{"prefixe": "000", "section": "AB", "numero": "0119"}])
+        postcodes = pd.Series(["75001"])
+        cities = pd.Series(["Paris"])
+
+        monkeypatch.setattr("verif_qpv.lookup_commune_insee", lambda *a, **k: "75056")
+        monkeypatch.setattr("verif_qpv.lookup_parcelle_coords", lambda *a, **k: None)
+        monkeypatch.setattr("verif_qpv.time.sleep", lambda x: None)
+
+        out = apply_cadastre_fallback(geo_df, parcelles, postcodes, cities, session=MagicMock())
+        assert out.loc[0, "source_geocodage"] == "BAN (cadastre indisponible)"
+        assert out.loc[0, "lat"] == 48.86  # inchangé
